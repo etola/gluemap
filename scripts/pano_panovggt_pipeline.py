@@ -199,9 +199,24 @@ def _reanchor_to_reference(workfolder: Path, registered_dir: Path) -> None:
     """
     import pymap3d
 
-    reference = _resolve_reference_lla(workfolder)
     manifest = json.loads(_find_manifest(workfolder).read_text())
     anchor = manifest["gps"]["enu_anchor"]
+    if anchor is None:
+        # GPS-less capture: the solve was aligned to the plan frame
+        # (start/end anchors) — nothing to translate. reference_lla is
+        # recorded only when the plan provides one.
+        ref_path = workfolder / "reference_lla.json"
+        reference = (
+            json.loads(ref_path.read_text()) if ref_path.exists() else None
+        )
+        (registered_dir / "reanchor.json").write_text(
+            json.dumps(
+                {"offset_enu": [0.0, 0.0, 0.0], "reference_lla": reference}
+            )
+        )
+        logger.info("[register] no GPS anchor; plan-frame poses kept as-is")
+        return
+    reference = _resolve_reference_lla(workfolder)
     # The anchor's EXIF altitude is deliberately replaced by the reference
     # altitude: the production referential carries no altitude priors (its
     # vertical datum is the reference origin, with the walk plane near
@@ -239,10 +254,12 @@ def stage_register(args: argparse.Namespace) -> None:
     if args.init_mode == "star":
         from pano_star_solve import solve as star_solve
 
+        start_end = args.workfolder / "start_end_points.json"
         star_solve(
             args.workfolder / "star_init",
             out_dir,
             min_edge_score=args.min_edge_score,
+            start_end_json=start_end if start_end.exists() else None,
         )
         _reanchor_to_reference(args.workfolder, out_dir)
         return
@@ -283,19 +300,28 @@ def stage_cubemap(args: argparse.Namespace) -> None:
     pano_w, pano_h = _first_image_size(images_dir)
     face_w = pano_w // 4
 
-    if (images_cubemap / "pano_camera0").is_dir() and not args.force:
-        logger.info("[cubemap] %s exists; skipping RGB faces", images_cubemap)
+    names = sorted(
+        p.name for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS
+    )
+    face0 = images_cubemap / "pano_camera0"
+    # Completeness check, not existence: an interrupted render (e.g. OOM)
+    # must not be mistaken for a finished stage.
+    missing = (
+        names
+        if args.force or not face0.is_dir()
+        else [n for n in names if not (face0 / n).exists()]
+    )
+    if not missing:
+        logger.info("[cubemap] %s complete; skipping RGB faces", images_cubemap)
     else:
         from ml_utils.pano import render_perspective_images
 
-        names = sorted(
-            p.name
-            for p in images_dir.iterdir()
-            if p.suffix.lower() in IMAGE_EXTS
+        logger.info(
+            "[cubemap] rendering %d/%d panos to faces", len(missing), len(names)
         )
         seg_dir = args.workfolder / "segmentations"
         render_perspective_images(
-            names,
+            missing,
             images_dir,
             images_cubemap,
             args.workfolder / "segmentations_cubemap",
@@ -407,6 +433,17 @@ def stage_correct(args: argparse.Namespace) -> None:
         corrected_colmap_dir=args.workfolder / "sfm" / "sparse_enu",
         out_dir=registered,
     )
+
+    # GPS-less initializations carry per-frame scale drift that the rigid
+    # pose correction cannot fix; register each depth map's scale to the
+    # SIFT model (production's register-to-SfM mechanism).
+    manifest = json.loads(_find_manifest(args.workfolder).read_text())
+    if manifest["gps"]["enu_anchor"] is None or args.rescale_dmaps:
+        from pano_rig_refine import rescale_dmaps_to_model
+
+        rescale_dmaps_to_model(
+            args.workfolder / "sfm" / "sparse_enu", registered
+        )
 
     # Re-render the face z-depths from the corrected dmaps so the MVS inputs
     # match the final calibration.
@@ -602,6 +639,13 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--refine_intrinsics", action="store_true")
     parser.add_argument("--gps_prior_weight", type=float, default=1.0)
     parser.add_argument("--gps_prior_sigma_m", type=float, default=0.25)
+    # correct (S7)
+    parser.add_argument(
+        "--rescale_dmaps",
+        action="store_true",
+        help="force per-frame depth-scale registration to the SIFT model "
+        "(automatic for GPS-less runs)",
+    )
     # export (S8)
     parser.add_argument("--skip_fuse", action="store_true")
     parser.add_argument("--fuse_via_colmap", action="store_true")

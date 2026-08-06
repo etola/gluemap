@@ -105,20 +105,22 @@ def main() -> None:
     n = len(names)
 
     fixes = [parse_gps_from_image(p) for p in image_paths]
-    enu, anchor = gps_fixes_to_enu(fixes)
+    if any(fix is not None for fix in fixes):
+        enu, anchor = gps_fixes_to_enu(fixes)
+    else:
+        # GPS-less capture (e.g. indoor video walk): stars fall back to
+        # sequential neighbors and the solve stays gauge-free until the
+        # start/end (or other) alignment.
+        enu, anchor = np.full((n, 3), np.nan), None
     logger.info("%d frames, %d with GPS", n, int(np.isfinite(enu[:, 0]).sum()))
 
     stars = build_stars(n, enu, args.star_size, args.seq_window)
 
     # Preload every pano once (resized to the model resolution).
     logger.info("Preloading %d panoramas ...", n)
-    stacked = _load_pano_tensor(
-        str(args.images), [p.name for p in image_paths]
-    )
+    stacked = _load_pano_tensor(str(args.images), [p.name for p in image_paths])
     if stacked.shape[0] != n:
-        raise RuntimeError(
-            f"Loaded {stacked.shape[0]}/{n} panoramas; aborting"
-        )
+        raise RuntimeError(f"Loaded {stacked.shape[0]}/{n} panoramas; aborting")
     tensors = list(stacked)
     target_h, target_w = tensors[0].shape[-2:]
 
@@ -177,11 +179,15 @@ def main() -> None:
             name: (enu[i].tolist() if np.all(np.isfinite(enu[i])) else None)
             for i, name in enumerate(names)
         },
-        "enu_anchor": {
-            "lat_deg": anchor.lat_deg,
-            "lon_deg": anchor.lon_deg,
-            "alt_m": anchor.alt_m,
-        },
+        "enu_anchor": (
+            {
+                "lat_deg": anchor.lat_deg,
+                "lon_deg": anchor.lon_deg,
+                "alt_m": anchor.alt_m,
+            }
+            if anchor is not None
+            else None
+        ),
         "stars": [
             {"center": names[m[0]], "members": [names[j] for j in m]}
             for m in stars
@@ -204,12 +210,16 @@ def main() -> None:
             for i in range(n)
         ],
         "gps": {
-            "enu_anchor": {
-                "lat_deg": anchor.lat_deg,
-                "lon_deg": anchor.lon_deg,
-                "alt_m": anchor.alt_m,
-                "has_altitude": anchor.has_altitude,
-            }
+            "enu_anchor": (
+                {
+                    "lat_deg": anchor.lat_deg,
+                    "lon_deg": anchor.lon_deg,
+                    "alt_m": anchor.alt_m,
+                    "has_altitude": anchor.has_altitude,
+                }
+                if anchor is not None
+                else None
+            )
         },
         "batches": [],
     }

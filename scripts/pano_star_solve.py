@@ -142,6 +142,75 @@ def compute_star_scores(
     return scores
 
 
+def leveling_rotation(rotations: dict[int, np.ndarray]) -> np.ndarray:
+    """Rotation aligning the median camera up-vector to +z (gravity leveling).
+
+    The pano frame is y-down, so the world up-vector of frame i is the
+    negated y row of its w2c rotation. Same construction as the
+    production pipeline's ground-plane alignment.
+    """
+    ups = np.stack([-rotations[i][1] for i in sorted(rotations)])
+    up = np.median(ups, axis=0)
+    up /= max(np.linalg.norm(up), 1e-9)
+    z_axis = np.array([0.0, 0.0, 1.0])
+    axis = np.cross(up, z_axis)
+    axis_norm = np.linalg.norm(axis)
+    if axis_norm < 1e-9:
+        if up[2] > 0:
+            return np.eye(3)
+        return Rotation.from_rotvec([np.pi, 0, 0]).as_matrix()
+    angle = np.arccos(np.clip(np.dot(up, z_axis), -1.0, 1.0))
+    return Rotation.from_rotvec(axis / axis_norm * angle).as_matrix()
+
+
+def start_end_alignment(
+    rotations: dict[int, np.ndarray],
+    centers: np.ndarray,
+    start_xyz: np.ndarray,
+    end_xyz: np.ndarray,
+):
+    """Sim(3) to the plan frame from start/end anchor points (GPS-less walks).
+
+    The production walkthrough aligns GPS-less captures with the plan's
+    start/end points: gravity leveling pins two rotation DOF, the
+    start-to-end segment fixes yaw and metric scale, and the start point
+    fixes translation. First/last frames are the anchors.
+    """
+    from ml_utils.sim3 import Sim3
+
+    u_level = leveling_rotation(rotations)
+    c_start = u_level @ centers[0]
+    c_end = u_level @ centers[-1]
+    seg_model = (c_end - c_start)[:2]
+    seg_plan = (end_xyz - start_xyz)[:2]
+    len_model = float(np.linalg.norm(seg_model))
+    len_plan = float(np.linalg.norm(seg_plan))
+    if len_model < 1e-6 or len_plan < 1e-6:
+        logger.warning(
+            "start/end segment degenerate (model %.3f, plan %.3f); "
+            "leveling only",
+            len_model,
+            len_plan,
+        )
+        return Sim3(scale=1.0, R=u_level, t=np.zeros(3))
+    scale = len_plan / len_model
+    yaw = np.arctan2(seg_plan[1], seg_plan[0]) - np.arctan2(
+        seg_model[1], seg_model[0]
+    )
+    r_yaw = Rotation.from_euler("z", yaw).as_matrix()
+    rot = r_yaw @ u_level
+    t = start_xyz - scale * (rot @ centers[0])
+    logger.info(
+        "start/end alignment: scale %.4f m/unit, yaw %.1f deg, "
+        "segment %.2f m (plan %.2f m)",
+        scale,
+        np.degrees(yaw),
+        len_model * scale,
+        len_plan,
+    )
+    return Sim3(scale=scale, R=rot, t=t)
+
+
 def gravity_and_gps_alignment(
     rotations: dict[int, np.ndarray],
     centers: np.ndarray,
@@ -163,23 +232,7 @@ def gravity_and_gps_alignment(
     """
     from ml_utils.sim3 import Sim3
 
-    # Median world up-vector: pano frame is y-down, so up = -y row of w2c.
-    ups = np.stack([-rotations[i][1] for i in sorted(rotations)])
-    up = np.median(ups, axis=0)
-    up /= max(np.linalg.norm(up), 1e-9)
-    z_axis = np.array([0.0, 0.0, 1.0])
-    axis = np.cross(up, z_axis)
-    axis_norm = np.linalg.norm(axis)
-    if axis_norm < 1e-9:
-        u_level = (
-            np.eye(3)
-            if up[2] > 0
-            else Rotation.from_rotvec([np.pi, 0, 0]).as_matrix()
-        )
-    else:
-        angle = np.arccos(np.clip(np.dot(up, z_axis), -1.0, 1.0))
-        u_level = Rotation.from_rotvec(axis / axis_norm * angle).as_matrix()
-
+    u_level = leveling_rotation(rotations)
     if have_gps.sum() < 4:
         return None
     c_lvl = centers[have_gps] @ u_level.T
@@ -211,6 +264,9 @@ def gravity_and_gps_alignment(
     t_z = float(np.mean(g[keep, 2] - scale * c_lvl[keep, 2]))
     r_yaw = np.eye(3)
     r_yaw[:2, :2] = r2
+    tilt_deg = np.degrees(
+        np.arccos(np.clip((np.trace(u_level) - 1.0) / 2.0, -1.0, 1.0))
+    )
     logger.info(
         "gravity+GPS alignment: scale %.4f, %d/%d inliers, "
         "xy rmse %.3f m, up tilt corrected %.2f deg",
@@ -218,7 +274,7 @@ def gravity_and_gps_alignment(
         int(keep.sum()),
         len(g),
         float(np.sqrt(np.mean(resid[keep] ** 2))),
-        float(np.degrees(np.arccos(np.clip(up[2], -1, 1)))),
+        float(tilt_deg),
     )
     return Sim3(
         scale=scale,
@@ -305,6 +361,7 @@ def solve(
     min_edge_score: float = 0.15,
     covis_tol: float = 0.05,
     points_per_star: int = 2000,
+    start_end_json: Path | None = None,
 ) -> None:
     import torch
 
@@ -382,18 +439,34 @@ def solve(
             gps_arr[i] = np.asarray(meta["enu"][name], dtype=np.float64)
     have_gps = np.all(np.isfinite(gps_arr), axis=1)
     sim3 = gravity_and_gps_alignment(rotations, centers_arr, gps_arr, have_gps)
-    scale_g = float(sim3.scale) if sim3 is not None else 1.0
+    use_gps_deltas = sim3 is not None
+    if sim3 is None and start_end_json is not None and start_end_json.exists():
+        points = json.loads(start_end_json.read_text())
+        if points.get("start_point") is not None and points.get("end_point"):
+            sim3 = start_end_alignment(
+                rotations,
+                centers_arr,
+                np.asarray(points["start_point"], dtype=np.float64),
+                np.asarray(points["end_point"], dtype=np.float64),
+            )
     if sim3 is None:
-        logger.warning("No usable GPS; output stays in the solve's gauge")
+        from ml_utils.sim3 import Sim3
+
+        logger.warning(
+            "No GPS and no start/end anchors; output is gravity-leveled "
+            "but up-to-scale"
+        )
+        sim3 = Sim3(scale=1.0, R=leveling_rotation(rotations), t=np.zeros(3))
+    scale_g = float(sim3.scale)
 
     c2w_all = np.zeros((len(names), 4, 4))
     for i in range(len(names)):
         c2w = np.eye(4)
         c2w[:3, :3] = rotations[i].T
         c2w[:3, 3] = centers[i]
-        c2w_all[i] = sim3.apply_pose(c2w) if sim3 is not None else c2w
+        c2w_all[i] = sim3.apply_pose(c2w)
 
-    if sim3 is not None:
+    if use_gps_deltas:
         deltas = smooth_gps_deltas(c2w_all[:, :3, 3].copy(), gps_arr, have_gps)
         c2w_all[:, :3, 3] += deltas
 
@@ -446,12 +519,19 @@ def main() -> None:
     parser.add_argument("--out_dir", type=Path, required=True)
     parser.add_argument("--min_edge_score", type=float, default=0.15)
     parser.add_argument("--covis_tol", type=float, default=0.05)
+    parser.add_argument(
+        "--start_end_json",
+        type=Path,
+        default=None,
+        help="start_end_points.json for GPS-less plan-frame alignment",
+    )
     args = parser.parse_args()
     solve(
         args.star_dir,
         args.out_dir,
         min_edge_score=args.min_edge_score,
         covis_tol=args.covis_tol,
+        start_end_json=args.start_end_json,
     )
 
 

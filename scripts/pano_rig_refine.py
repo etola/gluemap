@@ -47,11 +47,9 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from pano_sift_faces import FACE_PREFIX, load_registered_poses  # noqa: E402
+from pano_star_solve import _project_spherical  # noqa: E402
 from rig_refine import (  # noqa: E402
-    filter_observations,
     frame_center,
-    mean_reproj_px,
-    relink_observations,
     run_ba,
     run_gps_ba,
     write_ply,
@@ -96,11 +94,7 @@ def triangulate_sift(
         clear_points=True,
         options=options,
     )
-    logger.info(
-        "Triangulated %d SIFT points (mean reproj %.2f px)",
-        recon.num_points3D(),
-        mean_reproj_px(recon),
-    )
+    logger.info("Triangulated %d SIFT points", recon.num_points3D())
     return recon
 
 
@@ -321,12 +315,189 @@ def build_obs_lookup(
     return obs_lookup
 
 
+class ReprojEngine:
+    """Vectorized reprojection errors over a fixed observation set.
+
+    The per-round bookkeeping between BA solves (filter / relink /
+    mean-reproj) is pure-Python-per-observation in rig_refine.py, which
+    is fine at ~100k observations but becomes the single-core bottleneck
+    at millions. This engine gathers the static data (observation pixel
+    coordinates, per-observation image and point ids) once and evaluates
+    all reprojection errors as numpy array ops; only the observations
+    that actually change state go through pycolmap calls. The linked
+    state is tracked internally, so the reconstruction is never
+    re-scanned.
+    """
+
+    def __init__(
+        self, recon: pycolmap.Reconstruction, obs_lookup: list
+    ) -> None:
+        obs = np.asarray(obs_lookup, dtype=np.int64)
+        self.obs_iid = obs[:, 0]
+        self.obs_idx = obs[:, 1]
+        self.obs_pid = obs[:, 2]
+        self.linked = np.ones(len(obs), dtype=bool)
+
+        self.image_ids = np.array(sorted(recon.images.keys()))
+        slot_of = {int(iid): k for k, iid in enumerate(self.image_ids)}
+        self.obs_img = np.array(
+            [slot_of[int(i)] for i in self.obs_iid], dtype=np.int64
+        )
+        self.frame_of_image = np.array(
+            [recon.images[int(iid)].frame_id for iid in self.image_ids]
+        )
+
+        # Pixel coordinates never change; gather them in one pass.
+        self.obs_xy = np.empty((len(obs), 2))
+        by_image: dict[int, list[int]] = defaultdict(list)
+        for row, iid in enumerate(self.obs_iid):
+            by_image[int(iid)].append(row)
+        for iid, rows in by_image.items():
+            points2d = recon.images[iid].points2D
+            self.obs_xy[rows] = [
+                points2d[int(self.obs_idx[r])].xy for r in rows
+            ]
+
+        # SIMPLE_PINHOLE intrinsics per image (shared analytic K).
+        params = np.stack(
+            [
+                recon.cameras[recon.images[int(iid)].camera_id].params
+                for iid in self.image_ids
+            ]
+        )
+        self.focal = params[:, 0]
+        self.pp = params[:, 1:3]
+        cam0 = recon.cameras[min(recon.cameras)]
+        self.behind_penalty = 2.0 * float(np.hypot(cam0.width, cam0.height))
+
+    def errors(self, recon: pycolmap.Reconstruction) -> np.ndarray:
+        """Reprojection error per observation.
+
+        Behind-camera observations get the 2x-diagonal penalty (matching
+        rig_refine); observations whose point no longer exists get NaN.
+        """
+        mats = np.stack(
+            [
+                recon.images[int(iid)].cam_from_world().matrix()
+                for iid in self.image_ids
+            ]
+        )  # (M, 3, 4)
+        alive_pids = np.fromiter(recon.points3D.keys(), dtype=np.int64)
+        order = np.argsort(alive_pids)
+        alive_sorted = alive_pids[order]
+        xyz_sorted = np.stack(
+            [recon.points3D[int(p)].xyz for p in alive_sorted]
+        )
+        pos = np.clip(
+            np.searchsorted(alive_sorted, self.obs_pid),
+            0,
+            len(alive_sorted) - 1,
+        )
+        alive = alive_sorted[pos] == self.obs_pid
+        xyz = xyz_sorted[pos]
+
+        m = mats[self.obs_img]
+        x_cam = np.einsum("nij,nj->ni", m[:, :, :3], xyz) + m[:, :, 3]
+        z = x_cam[:, 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            proj = (
+                self.focal[self.obs_img, None] * x_cam[:, :2] / z[:, None]
+                + self.pp[self.obs_img]
+            )
+            err = np.linalg.norm(proj - self.obs_xy, axis=1)
+        err = np.where(z <= 0, self.behind_penalty, err)
+        err[~alive] = np.nan
+        return err
+
+    def mean_reproj_px(self, recon: pycolmap.Reconstruction) -> float:
+        err = self.errors(recon)[self.linked]
+        err = err[np.isfinite(err)]
+        return float(err.mean()) if err.size else 0.0
+
+    def filter_observations(
+        self,
+        recon: pycolmap.Reconstruction,
+        max_error_px: float,
+        min_track_length: int,
+    ) -> tuple[int, int]:
+        """Vectorized equivalent of rig_refine.filter_observations."""
+        err = self.errors(recon)
+        bad = self.linked & (np.isnan(err) | (err > max_error_px))
+        keep = self.linked & ~bad
+        # Surviving track length per point over the linked set.
+        pids, counts = np.unique(self.obs_pid[keep], return_counts=True)
+        short = set(pids[counts < min_track_length].tolist())
+        all_pids = set(np.unique(self.obs_pid[self.linked]).tolist())
+        short |= all_pids - set(pids.tolist())  # points losing every obs
+
+        obs_removed = 0
+        tracks_removed = 0
+        short_arr = (
+            np.fromiter(short, dtype=np.int64)
+            if short
+            else np.empty(0, dtype=np.int64)
+        )
+        kill_rows = np.nonzero(
+            self.linked & (bad | np.isin(self.obs_pid, short_arr))
+        )[0]
+        dead_pids: set[int] = set()
+        for row in kill_rows:
+            pid = int(self.obs_pid[row])
+            if pid in short:
+                if pid not in dead_pids:
+                    if pid in recon.points3D:
+                        obs_removed += recon.points3D[pid].track.length()
+                        recon.delete_point3D(pid)
+                        tracks_removed += 1
+                    dead_pids.add(pid)
+                self.linked[row] = False
+                continue
+            recon.points3D[pid].track.delete_element(
+                int(self.obs_iid[row]), int(self.obs_idx[row])
+            )
+            recon.images[int(self.obs_iid[row])].reset_point3D_for_point2D(
+                int(self.obs_idx[row])
+            )
+            self.linked[row] = False
+            obs_removed += 1
+        return obs_removed, tracks_removed
+
+    def relink_observations(
+        self, recon: pycolmap.Reconstruction, max_error_px: float
+    ) -> int:
+        """Vectorized equivalent of rig_refine.relink_observations."""
+        err = self.errors(recon)
+        good = ~self.linked & np.isfinite(err) & (err <= max_error_px)
+        relinked = 0
+        for row in np.nonzero(good)[0]:
+            pid = int(self.obs_pid[row])
+            iid, idx = int(self.obs_iid[row]), int(self.obs_idx[row])
+            image = recon.images[iid]
+            if image.points2D[idx].point3D_id != pycolmap.INVALID_POINT3D_ID:
+                continue
+            recon.points3D[pid].track.add_element(iid, idx)
+            image.set_point3D_for_point2D(idx, pid)
+            self.linked[row] = True
+            relinked += 1
+        return relinked
+
+    def linked_counts_by_frame(self) -> dict[int, int]:
+        counts: dict[int, int] = defaultdict(int)
+        frames = self.frame_of_image[self.obs_img[self.linked]]
+        for fid, cnt in zip(
+            *np.unique(frames, return_counts=True), strict=True
+        ):
+            counts[int(fid)] = int(cnt)
+        return counts
+
+
 def reregister_frames_rig(
     recon: pycolmap.Reconstruction,
     obs_lookup: list[tuple[int, int, int]],
     max_error_px: float,
     min_frame_obs: int,
     min_inliers: int,
+    linked_counts: dict[int, int] | None = None,
 ) -> int:
     """rig_refine.reregister_frames with the rig taken from the model itself."""
     identity = pycolmap.Rigid3d(
@@ -346,10 +517,14 @@ def reregister_frames_rig(
     slot_of_camera = {cam_id: i for i, cam_id in enumerate(cam_ids)}
 
     linked = {fid: 0 for fid in recon.frames}
-    for image in recon.images.values():
-        linked[image.frame_id] += sum(
-            p.point3D_id != pycolmap.INVALID_POINT3D_ID for p in image.points2D
-        )
+    if linked_counts is not None:
+        linked.update(linked_counts)
+    else:
+        for image in recon.images.values():
+            linked[image.frame_id] += sum(
+                p.point3D_id != pycolmap.INVALID_POINT3D_ID
+                for p in image.points2D
+            )
 
     by_frame: dict[int, list[tuple[int, int, int]]] = {}
     for image_id, idx, pid in obs_lookup:
@@ -400,6 +575,132 @@ def reregister_frames_rig(
             n_linked,
         )
     return num_reregistered
+
+
+def rescale_dmaps_to_model(
+    recon_dir: Path,
+    registered_dir: Path,
+    min_samples: int = 30,
+    scale_range: tuple[float, float] = (0.05, 20.0),
+) -> dict[str, float]:
+    """Per-frame scale registration of depth maps against the SIFT model.
+
+    GPS-less initializations accumulate multiplicative scale drift along
+    the sequential star chain; the SIFT BA restores one globally
+    consistent geometry, but the rigid per-frame pose correction cannot
+    fix the depth VALUES. This applies the production mechanism
+    (register-to-SfM): for every frame, scale the radial depth map by
+    the median ratio of triangulated SIFT depths to predicted depths at
+    the same viewing directions. Frames without enough samples borrow
+    the running median of the last trusted scales
+    (densify_mapanything's guard against glassy/blank frames).
+
+    Mutates ``registered_dir/dmaps`` in place and writes
+    ``rescale_report.json``. Returns the per-frame scales.
+    """
+    report_path = registered_dir / "rescale_report.json"
+    if report_path.exists():
+        logger.info("dmaps already rescaled (%s exists); skipping", report_path)
+        return json.loads(report_path.read_text())
+
+    recon = pycolmap.Reconstruction(str(recon_dir))
+    camera = recon.cameras[min(recon.cameras)]
+    focal = float(camera.params[0])
+    cx, cy = float(camera.params[1]), float(camera.params[2])
+    rig = single_rig(recon)
+    identity = np.eye(3)
+    rot_of_camera: dict[int, np.ndarray] = {}
+    for cam_id in recon.cameras:
+        sensor = pycolmap.sensor_t(pycolmap.SensorType.CAMERA, cam_id)
+        rot_of_camera[cam_id] = (
+            identity
+            if rig.is_ref_sensor(sensor)
+            else rig.sensor_from_rig(sensor).rotation.matrix()
+        )
+
+    scales: dict[str, float] = {}
+    trusted: list[float] = []
+    frames_sorted = sorted(
+        recon.frames.values(),
+        key=lambda f: pano_stem_of_image(
+            recon.images[
+                next(
+                    d.id
+                    for d in f.data_ids
+                    if d.sensor_id.type == pycolmap.SensorType.CAMERA
+                )
+            ].name
+        ),
+    )
+    for frame in frames_sorted:
+        image_ids = [
+            d.id
+            for d in frame.data_ids
+            if d.sensor_id.type == pycolmap.SensorType.CAMERA
+        ]
+        stem = pano_stem_of_image(recon.images[image_ids[0]].name)
+        dmap_path = registered_dir / "dmaps" / f"{stem}.npy"
+        if not dmap_path.exists():
+            continue
+        dmap = np.load(dmap_path)
+        dm_h, dm_w = dmap.shape
+        r_pano = frame.rig_from_world.rotation.matrix()
+        center = -r_pano.T @ frame.rig_from_world.translation
+
+        ratios: list[np.ndarray] = []
+        for iid in image_ids:
+            image = recon.images[iid]
+            xys, pids = [], []
+            for p2d in image.points2D:
+                if p2d.point3D_id != pycolmap.INVALID_POINT3D_ID:
+                    xys.append(p2d.xy)
+                    pids.append(p2d.point3D_id)
+            if not pids:
+                continue
+            xyz = np.stack([recon.points3D[p].xyz for p in pids])
+            radial_sfm = np.linalg.norm(xyz - center, axis=1)
+            xy = np.asarray(xys)
+            dirs_face = np.column_stack(
+                [
+                    (xy[:, 0] - cx) / focal,
+                    (xy[:, 1] - cy) / focal,
+                    np.ones(len(xy)),
+                ]
+            )
+            dirs_face /= np.linalg.norm(dirs_face, axis=1, keepdims=True)
+            dirs_pano = dirs_face @ rot_of_camera[image.camera_id]
+            u, v = _project_spherical(dirs_pano, dm_w, dm_h)
+            d_pred = dmap[v, u]
+            valid = np.isfinite(d_pred) & (d_pred > 0) & (radial_sfm > 0)
+            if valid.any():
+                ratios.append(radial_sfm[valid] / d_pred[valid])
+        samples = np.concatenate(ratios) if ratios else np.empty(0)
+        scale = (
+            float(np.median(samples)) if samples.size >= min_samples else None
+        )
+        if scale is not None and scale_range[0] <= scale <= scale_range[1]:
+            trusted.append(scale)
+            trusted = trusted[-16:]
+        elif trusted:
+            scale = float(np.median(trusted))
+        else:
+            scale = 1.0
+        scales[stem] = scale
+        rescaled = dmap.astype(np.float32) * scale
+        rescaled[dmap <= 0] = 0.0
+        np.save(dmap_path, rescaled)
+
+    values = np.array(list(scales.values()))
+    logger.info(
+        "Rescaled %d dmaps to the SfM model: scale median %.3f "
+        "(range %.3f..%.3f)",
+        len(scales),
+        float(np.median(values)),
+        float(values.min()),
+        float(values.max()),
+    )
+    report_path.write_text(json.dumps(scales))
+    return scales
 
 
 def load_gps_targets(
@@ -558,6 +859,7 @@ def run_refine_stage(
             recon, _virtual_pids = merge_virtual_tracks(recon, remapped)
 
     obs_lookup = build_obs_lookup(recon)
+    engine = ReprojEngine(recon, obs_lookup)
 
     # GPS priors join EVERY BA round (production pose-prior-mapper style):
     # a BA without priors relaxes the model back to the visually-consistent
@@ -579,7 +881,7 @@ def run_refine_stage(
         else:
             run_ba(recon, fix_intrinsics)
 
-    obs_removed, tracks_removed = filter_observations(
+    obs_removed, tracks_removed = engine.filter_observations(
         recon, 4 * max_reproj_error, min_track_length
     )
     logger.info(
@@ -589,13 +891,20 @@ def run_refine_stage(
         4 * max_reproj_error,
     )
     run_ba_round()
-    logger.info("After BA pass 1: mean reproj %.2f px", mean_reproj_px(recon))
+    logger.info(
+        "After BA pass 1: mean reproj %.2f px", engine.mean_reproj_px(recon)
+    )
 
     for round_idx in range(reregister_rounds):
         n_rereg = reregister_frames_rig(
-            recon, obs_lookup, 2 * max_reproj_error, min_frame_obs, min_inliers
+            recon,
+            obs_lookup,
+            2 * max_reproj_error,
+            min_frame_obs,
+            min_inliers,
+            linked_counts=engine.linked_counts_by_frame(),
         )
-        relinked = relink_observations(recon, obs_lookup, 2 * max_reproj_error)
+        relinked = engine.relink_observations(recon, 2 * max_reproj_error)
         logger.info(
             "Round %d: re-registered %d frames, re-linked %d observations",
             round_idx + 1,
@@ -604,7 +913,7 @@ def run_refine_stage(
         )
         if n_rereg == 0 and relinked == 0 and round_idx > 0:
             break
-        obs_removed, tracks_removed = filter_observations(
+        obs_removed, tracks_removed = engine.filter_observations(
             recon, max_reproj_error, min_track_length
         )
         logger.info(
@@ -617,17 +926,15 @@ def run_refine_stage(
         logger.info(
             "After BA round %d: mean reproj %.2f px",
             round_idx + 2,
-            mean_reproj_px(recon),
+            engine.mean_reproj_px(recon),
         )
 
     frame_ids = frame_id_by_pano_stem(recon)
     if targets:
         for gps_round in range(2):
             run_gps_ba(recon, targets, sigma_world)
-            relinked = relink_observations(
-                recon, obs_lookup, 2 * max_reproj_error
-            )
-            obs_removed, tracks_removed = filter_observations(
+            relinked = engine.relink_observations(recon, 2 * max_reproj_error)
+            obs_removed, tracks_removed = engine.filter_observations(
                 recon, max_reproj_error, min_track_length
             )
             logger.info(
@@ -637,7 +944,7 @@ def run_refine_stage(
                 relinked,
                 obs_removed,
                 tracks_removed,
-                mean_reproj_px(recon),
+                engine.mean_reproj_px(recon),
             )
 
     filter_far_points(recon)
