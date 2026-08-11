@@ -107,13 +107,14 @@ def stage_infer(args: argparse.Namespace) -> None:
             return
         loop_pairs = star_dir / "loop_pairs.json"
         if not args.no_loop_closure and not loop_pairs.exists():
-            # Appearance-based revisit candidates (SALAD, gluemap env):
-            # the loop mini-stars pin the scale chain that a
-            # sequential-only star graph leaves free to drift.
+            # Appearance-based revisit candidates (MegaLoc via
+            # ddpy_panovggt.vpr, so the PanoVGGT env runs it): the loop
+            # mini-stars pin the scale chain that a sequential-only star
+            # graph leaves free to drift.
             star_dir.mkdir(parents=True, exist_ok=True)
             subprocess.run(
                 [
-                    sys.executable,
+                    _panovggt_python(args),
                     str(SCRIPTS_DIR / "pano_loop_pairs.py"),
                     "--images",
                     str(args.workfolder / "images"),
