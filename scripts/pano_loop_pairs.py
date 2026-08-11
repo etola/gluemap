@@ -1,83 +1,110 @@
 #!/usr/bin/env python3
 """Appearance-based loop-closure candidates for the equirect star pipeline.
 
-Computes GLUEMAP's SALAD retrieval descriptors for every panorama
-(equirects resized to the 322px square input, exactly as
-gluemap.controllers.image_retrieval does) and emits long-range revisit
-candidates: pairs far apart in capture order but similar in appearance.
-pano_star_infer consumes them (--extra_pairs) as 4-frame mini-stars
-[i, i+1, j, j+1] whose sequential sub-edges pin the mini-star scale, so
-the loop edge transports metric scale across the revisit — closing the
-multiplicative scale drift a sequential-only chain accumulates.
+Computes MegaLoc retrieval descriptors (Berton & Masone, MIT license,
+loaded via torch.hub from gmberton/MegaLoc) for every panorama and emits
+long-range revisit candidates: pairs far apart in capture order but
+similar in appearance. pano_star_infer consumes them (--extra_pairs) as
+4-frame mini-stars [i, i+1, j, j+1] whose sequential sub-edges pin the
+mini-star scale, so the loop edge transports metric scale across the
+revisit — closing the multiplicative scale drift a sequential-only
+chain accumulates.
 
-Runs in the GLUEMAP environment (needs the repo + dino_salad.ckpt).
+Each equirect contributes FOUR heading descriptors (square crops at
+yaw 0/90/180/270, each spanning 180 deg horizontally): revisits happen
+at arbitrary headings, and a perspective-trained VPR model reads a
+heading-local crop far better than a squashed full equirect. Pair
+similarity is the max over the 4x4 crop combinations.
+
+No gluemap-repo dependency: torch.hub downloads the model (cached under
+~/.cache/torch/hub; weights via huggingface_hub) on first use.
 """
 
 import argparse
 import json
 import logging
-import sys
 from pathlib import Path
 
-SCRIPTS_DIR = Path(__file__).resolve().parent
-REPO_DIR = SCRIPTS_DIR.parent
-for path in (str(REPO_DIR), str(REPO_DIR / "thirdparty")):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+INPUT_SIZE = 322  # DINOv2 patch 14: MegaLoc's recommended eval resolution
+NUM_HEADINGS = 4
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
-def compute_descriptors(
-    image_paths: list[Path], checkpoint: Path, device: str, batch_size: int
-):
+def heading_crops(equirect: np.ndarray) -> list[np.ndarray]:
+    """Four square heading crops (yaw 0/90/180/270) of an equirect image.
+
+    Each crop is the HxH window centred on the heading — 180 deg of
+    horizontal field of view on a W = 2H equirect — resized to the
+    model input. Wrap-around is handled by rolling.
+    """
+    import cv2
+
+    h, w = equirect.shape[:2]
+    crops = []
+    for k in range(NUM_HEADINGS):
+        center = int(round(k * w / NUM_HEADINGS))
+        rolled = np.roll(equirect, w // 2 - center, axis=1)
+        window = rolled[:, (w - h) // 2 : (w + h) // 2]
+        crops.append(
+            cv2.resize(
+                window, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_AREA
+            )
+        )
+    return crops
+
+
+def compute_descriptors(image_paths: list[Path], device: str, batch_size: int):
+    """(N, NUM_HEADINGS, D) L2-normalized MegaLoc descriptors."""
+    import cv2
     import torch
 
-    import thirdparty.path_to_thirdparty  # noqa: F401  (sys.path setup)
-    from gluemap.utils.load_fn import load_and_preprocess_images
-    from gluemap.utils.model_loader import _import_vpr_model
-
-    vpr_model = _import_vpr_model()
-    model = vpr_model(
-        backbone_arch="dinov2_vitb14",
-        backbone_config={
-            "num_trainable_blocks": 4,
-            "return_token": True,
-            "norm_layer": True,
-        },
-        agg_arch="SALAD",
-        agg_config={
-            "num_channels": 768,
-            "num_clusters": 64,
-            "cluster_dim": 128,
-            "token_dim": 256,
-        },
-    )
-    model.load_state_dict(
-        torch.load(checkpoint, map_location="cpu", weights_only=False),
-        strict=False,
-    )
+    model = torch.hub.load("gmberton/MegaLoc", "get_trained_model")
     model.eval().to(device)
 
-    descriptors = []
-    paths = [str(p) for p in image_paths]
-    for i in range(0, len(paths), batch_size):
-        images, _, _ = load_and_preprocess_images(
-            paths[i : i + batch_size],
-            image_size=322,
-            patch_size=14,
-            force_square=True,
-        )
+    batch: list[np.ndarray] = []
+    chunks = []
+
+    def flush() -> None:
+        if not batch:
+            return
+        arr = np.stack(batch).astype(np.float32) / 255.0
+        arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+        tensor = torch.from_numpy(arr).permute(0, 3, 1, 2).to(device)
         with torch.no_grad():
-            descriptors.append(model(images.to(device)).cpu())
-        if (i // batch_size) % 10 == 0:
-            logger.info(
-                "descriptors %d/%d", min(i + batch_size, len(paths)), len(paths)
-            )
-    desc = torch.cat(descriptors)
-    return torch.nn.functional.normalize(desc, dim=1)
+            chunks.append(model(tensor).cpu())
+        batch.clear()
+
+    for i, path in enumerate(image_paths):
+        bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(path)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        batch.extend(heading_crops(rgb))
+        if len(batch) >= batch_size:
+            flush()
+        if i % 50 == 0:
+            logger.info("descriptors %d/%d", i, len(image_paths))
+    flush()
+    desc = torch.cat(chunks)
+    desc = torch.nn.functional.normalize(desc, dim=1)
+    return desc.reshape(len(image_paths), NUM_HEADINGS, -1)
+
+
+def pooled_similarity(desc):
+    """(N, N) similarity: max over the heading-crop combinations."""
+    import torch
+
+    n, k, dim = desc.shape
+    flat = desc.reshape(n * k, dim)
+    sim = flat @ flat.T  # (n*k, n*k)
+    sim = sim.reshape(n, k, n, k)
+    return torch.amax(sim, dim=(1, 3))
 
 
 def select_loop_pairs(
@@ -114,11 +141,6 @@ def main() -> None:
     )
     parser.add_argument("--images", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=REPO_DIR / "checkpoints" / "dino_salad.ckpt",
-    )
     parser.add_argument("--top_k", type=int, default=5)
     parser.add_argument(
         "--min_gap",
@@ -128,7 +150,12 @@ def main() -> None:
     )
     parser.add_argument("--min_similarity", type=float, default=0.3)
     parser.add_argument("--max_pairs", type=int, default=1000)
-    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=24,
+        help="crops per forward pass (4 crops per pano)",
+    )
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -136,10 +163,8 @@ def main() -> None:
         p for p in args.images.iterdir() if p.suffix.lower() in IMAGE_EXTS
     )
     names = [p.stem for p in image_paths]
-    desc = compute_descriptors(
-        image_paths, args.checkpoint, args.device, args.batch_size
-    )
-    similarity = desc @ desc.T
+    desc = compute_descriptors(image_paths, args.device, args.batch_size)
+    similarity = pooled_similarity(desc)
     pairs = select_loop_pairs(
         similarity,
         names,
