@@ -97,6 +97,14 @@ def main() -> None:
         "sub-edges pin its scale, so the loop edge transports metric "
         "scale across the revisit",
     )
+    parser.add_argument(
+        "--loop_max_prior_dist",
+        type=float,
+        default=4.0,
+        help="reject loop pairs whose position priors are farther apart "
+        "than this (m) — doppelganger guard; only applies when both "
+        "ends have priors",
+    )
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -130,10 +138,24 @@ def main() -> None:
     if args.extra_pairs is not None and args.extra_pairs.exists():
         idx_of = {name: i for i, name in enumerate(names)}
         loop_pairs = json.loads(args.extra_pairs.read_text())["pairs"]
-        num_added = 0
+        num_added = num_aliased = 0
         for name_i, name_j, _score in loop_pairs:
             i, j = idx_of.get(name_i), idx_of.get(name_j)
             if i is None or j is None:
+                continue
+            # Prior gate against doppelganger revisits: self-similar
+            # interiors (identical aisles) pass appearance retrieval AND
+            # geometric covis scoring, and the resulting false edges drag
+            # whole segments onto the wrong pass (560d: 86 aliased pairs
+            # around one segment, up to 26 m apart). When both ends carry
+            # a position prior, a genuine revisit must be nearby.
+            if (
+                np.all(np.isfinite(enu[i]))
+                and np.all(np.isfinite(enu[j]))
+                and float(np.linalg.norm(enu[i] - enu[j]))
+                > args.loop_max_prior_dist
+            ):
+                num_aliased += 1
                 continue
             members = [i, min(i + 1, n - 1), j, min(j + 1, n - 1)]
             members = list(dict.fromkeys(members))  # dedupe, keep order
@@ -141,9 +163,12 @@ def main() -> None:
                 stars.append(members)
                 num_added += 1
         logger.info(
-            "Added %d loop-closure mini-stars from %s",
+            "Added %d loop-closure mini-stars from %s "
+            "(%d rejected by the %.1f m prior gate)",
             num_added,
             args.extra_pairs,
+            num_aliased,
+            args.loop_max_prior_dist,
         )
 
     # Preload every pano once (resized to the model resolution).

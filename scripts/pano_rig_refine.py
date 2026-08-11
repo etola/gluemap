@@ -1042,6 +1042,7 @@ def run_refine_stage(
             )
 
     filter_far_points(recon)
+    report_prior_deviation(recon, targets)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     recon_dir = out_dir / "sparse_enu"
@@ -1050,6 +1051,67 @@ def run_refine_stage(
     export_pano_poses(recon, frame_ids, out_dir)
     logger.info("Wrote %s", recon_dir)
     return recon
+
+
+def report_prior_deviation(
+    recon: pycolmap.Reconstruction,
+    targets: dict[int, np.ndarray],
+    flag_threshold: float = 0.5,
+) -> None:
+    """Log how far the solved frames sit from their position priors.
+
+    The median hides localized failures: a coherently misplaced segment
+    (e.g. dragged onto the wrong aisle by aliased loop edges) saturates
+    the priors' Huber loss and survives the BA — visible only in the
+    tail. Logs median/p90/max horizontal deviation and every contiguous
+    run of frames beyond ``flag_threshold``.
+    """
+    if not targets:
+        return
+    stem_dev: list[tuple[str, float]] = []
+    for fid, target in targets.items():
+        try:
+            frame = recon.frames[fid]
+        except (KeyError, IndexError):
+            continue
+        rot = frame.rig_from_world.rotation.matrix()
+        center = -(rot.T @ frame.rig_from_world.translation)
+        stem = pano_stem_of_image(
+            recon.images[
+                next(
+                    d.id
+                    for d in frame.data_ids
+                    if d.sensor_id.type == pycolmap.SensorType.CAMERA
+                )
+            ].name
+        )
+        stem_dev.append((stem, float(np.linalg.norm(center[:2] - target[:2]))))
+    stem_dev.sort()
+    dev = np.array([d for _, d in stem_dev])
+    logger.info(
+        "prior deviation (horizontal): median %.3f p90 %.3f max %.3f m",
+        float(np.median(dev)),
+        float(np.percentile(dev, 90)),
+        float(dev.max()),
+    )
+    runs: list[tuple[int, int]] = []
+    for i, d in enumerate(dev):
+        if d <= flag_threshold:
+            continue
+        if runs and i - runs[-1][1] <= 3:
+            runs[-1] = (runs[-1][0], i)
+        else:
+            runs.append((i, i))
+    for a, b in runs:
+        if b - a >= 2:  # only coherent segments, not lone frames
+            logger.warning(
+                "prior-deviating segment: %s..%s (%d frames, max %.2f m) "
+                "— possible aliased geometry; inspect before trusting",
+                stem_dev[a][0],
+                stem_dev[b][0],
+                b - a + 1,
+                float(dev[a : b + 1].max()),
+            )
 
 
 def get_args() -> argparse.Namespace:
