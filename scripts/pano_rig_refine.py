@@ -577,31 +577,98 @@ def reregister_frames_rig(
     return num_reregistered
 
 
+def fit_log_linear_correction(
+    d_pred: np.ndarray,
+    ratios: np.ndarray,
+    rng: np.random.Generator,
+    holdout_frac: float = 0.2,
+    min_samples: int = 50,
+    min_logd_spread: float = 0.15,
+    iters: int = 3,
+) -> tuple[float, float, dict] | None:
+    """Robust fit of ``log(ratio) = a + b*log(d_pred)`` with held-out check.
+
+    The multiplicative error field ``e(d) = exp(a + b*log d)`` generalizes
+    the constant register-to-SfM scale (``b = 0``) to distance-dependent
+    bias — the dominant depth-correlated monocular failure mode. Fitting
+    is IRLS (Cauchy on the log-residual MAD); a random held-out subset
+    arbitrates: the field is returned only when its held-out median
+    |log residual| beats the constant model's, so a frame whose error
+    really is a single scale keeps the old behavior. Returns
+    ``(a, b, info)`` or ``None`` (use the constant scale).
+    """
+    if len(ratios) < min_samples:
+        return None
+    x = np.log(d_pred)
+    y = np.log(ratios)
+    if float(x.std()) < min_logd_spread:
+        return None  # b is unconstrained on a narrow depth range
+    idx = rng.permutation(len(x))
+    n_hold = max(int(len(x) * holdout_frac), 10)
+    hold, fit = idx[:n_hold], idx[n_hold:]
+    xf, yf = x[fit], y[fit]
+    w = np.ones(len(xf))
+    a = b = 0.0
+    for _ in range(iters):
+        wsum = float(w.sum())
+        xm = float((w * xf).sum()) / wsum
+        ym = float((w * yf).sum()) / wsum
+        var = float((w * (xf - xm) ** 2).sum())
+        if var < 1e-9:
+            return None
+        b = float((w * (xf - xm) * (yf - ym)).sum()) / var
+        a = ym - b * xm
+        r = np.abs(yf - (a + b * xf))
+        mad = float(np.median(r)) + 1e-9
+        w = 1.0 / (1.0 + (r / (3.0 * 1.4826 * mad)) ** 2)
+    const = float(np.median(yf))
+    resid_field = float(np.median(np.abs(y[hold] - (a + b * x[hold]))))
+    resid_const = float(np.median(np.abs(y[hold] - const)))
+    if resid_field >= resid_const:
+        return None
+    return (
+        a,
+        b,
+        {
+            "holdout_median_field": resid_field,
+            "holdout_median_const": resid_const,
+            "num_fit": int(len(fit)),
+            "num_holdout": int(len(hold)),
+        },
+    )
+
+
 def rescale_dmaps_to_model(
     recon_dir: Path,
     registered_dir: Path,
     min_samples: int = 30,
     scale_range: tuple[float, float] = (0.05, 20.0),
+    error_field: bool = True,
 ) -> dict[str, float]:
-    """Per-frame scale registration of depth maps against the SIFT model.
+    """Per-frame depth registration against the SIFT model.
 
     GPS-less initializations accumulate multiplicative scale drift along
     the sequential star chain; the SIFT BA restores one globally
     consistent geometry, but the rigid per-frame pose correction cannot
     fix the depth VALUES. This applies the production mechanism
-    (register-to-SfM): for every frame, scale the radial depth map by
-    the median ratio of triangulated SIFT depths to predicted depths at
-    the same viewing directions. Frames without enough samples borrow
-    the running median of the last trusted scales
-    (densify_mapanything's guard against glassy/blank frames).
+    (register-to-SfM): for every frame, compare triangulated track
+    depths (SIFT and virtual alike) against the predicted depths at the
+    same viewing directions. The constant per-frame scale is the median
+    ratio; with ``error_field`` each frame is additionally offered the
+    log-linear field ``e(d) = exp(a + b*log d)``
+    (:func:`fit_log_linear_correction`) and takes it only when it wins
+    on held-out samples. Frames without enough samples borrow the
+    running median of the last trusted scales (densify_mapanything's
+    guard against glassy/blank frames).
 
     Mutates ``registered_dir/dmaps`` in place and writes
-    ``rescale_report.json``. Returns the per-frame scales.
+    ``rescale_report.json``. Returns the per-frame (constant) scales.
     """
     report_path = registered_dir / "rescale_report.json"
     if report_path.exists():
         logger.info("dmaps already rescaled (%s exists); skipping", report_path)
-        return json.loads(report_path.read_text())
+        report = json.loads(report_path.read_text())
+        return report.get("scales", report)
 
     recon = pycolmap.Reconstruction(str(recon_dir))
     camera = recon.cameras[min(recon.cameras)]
@@ -619,6 +686,8 @@ def rescale_dmaps_to_model(
         )
 
     scales: dict[str, float] = {}
+    fields: dict[str, dict] = {}
+    rng = np.random.default_rng(0)
     trusted: list[float] = []
     frames_sorted = sorted(
         recon.frames.values(),
@@ -648,6 +717,7 @@ def rescale_dmaps_to_model(
         center = -r_pano.T @ frame.rig_from_world.translation
 
         ratios: list[np.ndarray] = []
+        preds: list[np.ndarray] = []
         for iid in image_ids:
             image = recon.images[iid]
             xys, pids = [], []
@@ -674,11 +744,16 @@ def rescale_dmaps_to_model(
             valid = np.isfinite(d_pred) & (d_pred > 0) & (radial_sfm > 0)
             if valid.any():
                 ratios.append(radial_sfm[valid] / d_pred[valid])
+                preds.append(d_pred[valid])
         samples = np.concatenate(ratios) if ratios else np.empty(0)
+        d_samples = np.concatenate(preds) if preds else np.empty(0)
         scale = (
             float(np.median(samples)) if samples.size >= min_samples else None
         )
-        if scale is not None and scale_range[0] <= scale <= scale_range[1]:
+        own_scale = scale is not None and (
+            scale_range[0] <= scale <= scale_range[1]
+        )
+        if own_scale:
             trusted.append(scale)
             trusted = trusted[-16:]
         elif trusted:
@@ -686,20 +761,39 @@ def rescale_dmaps_to_model(
         else:
             scale = 1.0
         scales[stem] = scale
-        rescaled = dmap.astype(np.float32) * scale
-        rescaled[dmap <= 0] = 0.0
+
+        field = None
+        if error_field and own_scale:
+            field = fit_log_linear_correction(d_samples, samples, rng)
+        rescaled = dmap.astype(np.float32)
+        valid_px = dmap > 0
+        if field is not None:
+            a, b, info = field
+            corr = np.ones_like(rescaled)
+            corr[valid_px] = np.clip(
+                np.exp(a + b * np.log(rescaled[valid_px])),
+                scale_range[0],
+                scale_range[1],
+            )
+            rescaled = rescaled * corr
+            fields[stem] = {"a": a, "b": b, **info}
+        else:
+            rescaled = rescaled * scale
+        rescaled[~valid_px] = 0.0
         np.save(dmap_path, rescaled)
 
     values = np.array(list(scales.values()))
     logger.info(
-        "Rescaled %d dmaps to the SfM model: scale median %.3f "
-        "(range %.3f..%.3f)",
+        "Registered %d dmaps to the SfM model: scale median %.3f "
+        "(range %.3f..%.3f), %d/%d frames took the log-linear field",
         len(scales),
         float(np.median(values)),
         float(values.min()),
         float(values.max()),
+        len(fields),
+        len(scales),
     )
-    report_path.write_text(json.dumps(scales))
+    report_path.write_text(json.dumps({"scales": scales, "fields": fields}))
     return scales
 
 

@@ -83,6 +83,20 @@ MIN_FRAMES = 20
 # Skip the correction if it doesn't clearly improve alignment or moves a
 # wide swath of frames far. Metrics are still recorded when skipped.
 CORRECTION_P90_M = 1.0
+# --- robustness: global pre-alignment + out-of-sheet gating ---------------
+PREALIGN_TRIM = 1.0  # m: |SDF| clip in the coarse-search objective
+PREALIGN_MIN_GAIN = 0.05  # apply only if the trimmed score improves >= 5%
+PREALIGN_MAX_POINTS = 30000
+# Corridors are translation-invariant along their own axis, so distant
+# minima can alias. The search stays within plausible anchor error and a
+# movement penalty makes the NEAREST minimum win ties.
+PREALIGN_T_RANGE = 2.0  # m
+PREALIGN_PENALTY_T = 0.02  # score units per meter of shift
+PREALIGN_PENALTY_YAW = 0.3  # score units per radian of yaw
+# A frame keeps its SDF factor only while its fraction of wall points
+# near drawn ink stays above this share of the capture's median fraction.
+OFFSHEET_REL_FRACTION = 0.5
+OFFSHEET_MIN_MEDIAN = 0.2  # below this the whole capture mismatches; no gate
 # --- structure: track/virtual bearing-range factors (production values) ---
 TRACK_MIN_OBS = 3
 # Frame-scaled cap keeps BA solve cost proportional to trajectory size.
@@ -443,6 +457,105 @@ def extract_frame_walls(
 # ==========================================================================
 
 
+def apply_se2_to_frames(
+    frames: list[FrameWalls], theta: float, t: np.ndarray
+) -> list[FrameWalls]:
+    """Frames under the world SE2 ``p' = R(theta) p + t`` (walls are
+    body-frame, so only the pose fields change)."""
+    c, s = np.cos(theta), np.sin(theta)
+    out = []
+    for f in frames:
+        out.append(
+            FrameWalls(
+                frame_id=f.frame_id,
+                name=f.name,
+                x=float(c * f.x - s * f.y + t[0]),
+                y=float(s * f.x + c * f.y + t[1]),
+                yaw=f.yaw + theta,
+                wall_body=f.wall_body,
+                normal_body=f.normal_body,
+            )
+        )
+    return out
+
+
+def coarse_prealign(
+    frames: list[FrameWalls],
+    sample_fn,
+    rng: np.random.Generator,
+) -> tuple[float, np.ndarray, dict]:
+    """Global SE2 chamfer search: snap ALL wall points onto the plan at once.
+
+    The per-frame solve cannot recover an initial error beyond the SDF
+    reject gate (0.5 m) — a rotated or offset capture starts with every
+    residual gated off. This coarse-to-fine grid search over (yaw about
+    the wall centroid, translation) minimizes the trimmed mean
+    ``min(|SDF|, PREALIGN_TRIM)`` over a subsample of all wall points,
+    so out-of-sheet points saturate instead of dominating. Returns
+    ``(theta, t, info)`` — the world SE2 (identity when the search
+    cannot beat the initial score by ``PREALIGN_MIN_GAIN``).
+    """
+    pts = np.vstack(walls_world(frames, [(f.x, f.y, f.yaw) for f in frames]))
+    if len(pts) > PREALIGN_MAX_POINTS:
+        pts = pts[rng.choice(len(pts), PREALIGN_MAX_POINTS, replace=False)]
+    centroid = pts.mean(axis=0)
+
+    def score(theta: float, dx: np.ndarray, dy: np.ndarray) -> np.ndarray:
+        c, s = np.cos(theta), np.sin(theta)
+        rel = pts - centroid
+        rx = c * rel[:, 0] - s * rel[:, 1] + centroid[0]
+        ry = s * rel[:, 0] + c * rel[:, 1] + centroid[1]
+        east = rx[None, :] + dx[:, None]
+        north = ry[None, :] + dy[:, None]
+        vals = np.abs(sample_fn(east, north)[0])
+        return np.minimum(vals, PREALIGN_TRIM).mean(axis=1)
+
+    base = float(score(0.0, np.zeros(1), np.zeros(1))[0])
+    best = (0.0, 0.0, 0.0, base)  # tracked on the PENALIZED score
+    stages = [
+        (np.radians(8.0), np.radians(1.0), PREALIGN_T_RANGE, 0.5),
+        (np.radians(1.0), np.radians(0.25), 0.6, 0.1),
+    ]
+    for yaw_range, yaw_step, t_range, t_step in stages:
+        yaw0, dx0, dy0 = best[0], best[1], best[2]
+        yaws = yaw0 + np.arange(-yaw_range, yaw_range + 1e-9, yaw_step)
+        offs = np.arange(-t_range, t_range + 1e-9, t_step)
+        dxs = (dx0 + offs[:, None]).repeat(len(offs), 1).ravel()
+        dys = np.tile(dy0 + offs, len(offs))
+        for theta in yaws:
+            sc = (
+                score(float(theta), dxs, dys)
+                + PREALIGN_PENALTY_T * np.hypot(dxs, dys)
+                + PREALIGN_PENALTY_YAW * abs(float(theta))
+            )
+            k = int(np.argmin(sc))
+            if sc[k] < best[3]:
+                best = (
+                    float(theta),
+                    float(dxs[k]),
+                    float(dys[k]),
+                    float(sc[k]),
+                )
+    theta, dx, dy, _ = best
+    sc = float(score(theta, np.array([dx]), np.array([dy]))[0])
+    gain = (base - sc) / max(base, 1e-9)  # gain judged on the RAW score
+    info = {
+        "score_before": base,
+        "score_after": sc,
+        "gain": gain,
+        "yaw_deg": float(np.degrees(theta)),
+        "shift_m": [dx, dy],
+        "applied": bool(gain >= PREALIGN_MIN_GAIN),
+    }
+    if not info["applied"]:
+        return 0.0, np.zeros(2), info
+    # rotation about the centroid + shift, expressed as p' = R p + t
+    c, s = np.cos(theta), np.sin(theta)
+    rot = np.array([[c, -s], [s, c]])
+    t = centroid - rot @ centroid + np.array([dx, dy])
+    return theta, t, info
+
+
 def sdf_factor(key: int, walls: FrameWalls, sample_fn):
     """GTSAM CustomFactor: normal-gated, robust wall->plan distance.
 
@@ -504,6 +617,7 @@ def optimize_poses(
     landmarks: dict[int, np.ndarray] | None = None,
     colmap_obs: list[tuple[int, int, float, float]] = (),
     virtual_obs: list[tuple[int, int, float, float]] = (),
+    sdf_mask: np.ndarray | None = None,
 ):
     """2D BA: odometry + per-frame prior + normal-gated SDF, single pass.
 
@@ -553,7 +667,8 @@ def optimize_poses(
             )
         )
     for i, f in enumerate(frames):
-        graph.add(sdf_factor(i, f, sample_fn))
+        if sdf_mask is None or sdf_mask[i]:
+            graph.add(sdf_factor(i, f, sample_fn))
 
     params = gtsam.LevenbergMarquardtParams()
     result = gtsam.LevenbergMarquardtOptimizer(graph, init, params).optimize()
@@ -1075,11 +1190,15 @@ def frame_sdf_stats(
     frames: list[FrameWalls],
     poses: list[tuple[float, float, float]],
     sample_fn,
+    trim: float | None = None,
 ) -> np.ndarray:
-    """Mean |SDF| per frame (meters) under the given poses."""
+    """Mean |SDF| per frame (meters), optionally trimmed at ``trim``."""
     means = np.empty(len(frames))
     for i, pts in enumerate(walls_world(frames, poses)):
-        means[i] = float(np.mean(np.abs(sample_fn(pts[:, 0], pts[:, 1])[0])))
+        vals = np.abs(sample_fn(pts[:, 0], pts[:, 1])[0])
+        if trim is not None:
+            vals = np.minimum(vals, trim)
+        means[i] = float(np.mean(vals))
     return means
 
 
@@ -1163,8 +1282,16 @@ def run(
     model_dir: Path | None = None,
     structure: bool = True,
     apply: bool = False,
+    prealign: bool = True,
 ) -> dict:
     """Plan georeference + wall extraction + |SDF| report; optional solve.
+
+    With ``prealign`` (default) the solve is preceded by a coarse
+    global SE2 chamfer search (:func:`coarse_prealign`) that recovers
+    initial rotations/offsets beyond the SDF reject gate, and frames
+    whose walls do not correspond to drawn ink lose their SDF factor
+    (out-of-sheet gate). The guard then judges the per-frame solve's
+    residual movement; the write-back carries the total correction.
 
     Without ``solve`` this is the M1 diagnosis under the current poses.
     With ``solve`` the SE2 optimization runs and, when it passes the
@@ -1242,6 +1369,60 @@ def run(
         )
         report["solve"] = {"skipped": f"frames < {min_frames}"}
     elif solve:
+        frames_solve = frames
+        if prealign:
+            theta, t_pre, pre_info = coarse_prealign(
+                frames, sample_fn, np.random.default_rng(2)
+            )
+            report["prealign"] = pre_info
+            if pre_info["applied"]:
+                frames_solve = apply_se2_to_frames(frames, theta, t_pre)
+            logger.info(
+                "pre-align: yaw %+.2f deg, shift (%+.2f, %+.2f) m, "
+                "trimmed score %.3f -> %.3f (%s)",
+                pre_info["yaw_deg"],
+                pre_info["shift_m"][0],
+                pre_info["shift_m"][1],
+                pre_info["score_before"],
+                pre_info["score_after"],
+                "applied" if pre_info["applied"] else "not worth it",
+            )
+
+        # Out-of-sheet gate: frames whose walls do not plausibly
+        # correspond to drawn ink lose their SDF factor (they keep
+        # odometry, priors, and structure, so the chain stays rigid).
+        # The statistic is the fraction of the frame's wall points
+        # within SDF_REJECT of ink — a mean saturates too slowly
+        # because panos see far and always catch some drawn walls.
+        poses_pre = [(f.x, f.y, f.yaw) for f in frames_solve]
+        near_frac = np.empty(len(frames_solve))
+        for i, pts in enumerate(walls_world(frames_solve, poses_pre)):
+            vals = np.abs(sample_fn(pts[:, 0], pts[:, 1])[0])
+            near_frac[i] = float((vals <= SDF_REJECT).mean())
+        med_frac = float(np.median(near_frac))
+        if med_frac >= OFFSHEET_MIN_MEDIAN:
+            gate = OFFSHEET_REL_FRACTION * med_frac
+            sdf_mask = near_frac >= gate
+        else:
+            # The whole capture mismatches the plan (e.g. envelope-only
+            # sheets); leave every SDF factor in and let the guard rule.
+            gate = 0.0
+            sdf_mask = np.ones(len(frames_solve), dtype=bool)
+        report["sdf_gate"] = {
+            "median_near_fraction": med_frac,
+            "threshold_fraction": gate,
+            "masked_frames": int((~sdf_mask).sum()),
+        }
+        if (~sdf_mask).any():
+            logger.info(
+                "out-of-sheet gate: %d/%d frames lose their SDF factor "
+                "(near-ink fraction < %.2f; capture median %.2f)",
+                int((~sdf_mask).sum()),
+                len(frames_solve),
+                gate,
+                med_frac,
+            )
+
         landmarks: dict[int, np.ndarray] = {}
         colmap_obs: list[tuple[int, int, float, float]] = []
         virtual_obs: list[tuple[int, int, float, float]] = []
@@ -1258,6 +1439,10 @@ def run(
             info_by_name = {
                 Path(i["keyframe_name"]).stem: i for i in frame_infos
             }
+            # Measurements (bearing/range) are body-frame and therefore
+            # invariant to the global pre-alignment, so the structure is
+            # built from the ORIGINAL geometry; only the landmark initial
+            # values must follow the poses into the pre-aligned frame.
             landmarks, colmap_obs, virtual_obs, stats = build_structure(
                 frames,
                 info_by_name,
@@ -1266,6 +1451,10 @@ def run(
                 covisibility,
                 np.random.default_rng(1),
             )
+            if frames_solve is not frames:
+                c, s = np.cos(theta), np.sin(theta)
+                rot = np.array([[c, -s], [s, c]])
+                landmarks = {k: rot @ xy + t_pre for k, xy in landmarks.items()}
             logger.info(
                 "structure: cap %d, %d tracks (%d obs), %d virtual "
                 "(%d obs), min coverage %d, %d starved frames",
@@ -1285,16 +1474,27 @@ def run(
                 "min_frame_cov": stats.min_frame_cov,
                 "starved_frames": stats.starved_frames,
             }
-        init, result = optimize_poses(
-            frames,
+        init_pre, result = optimize_poses(
+            frames_solve,
             sample_fn,
             landmarks=landmarks,
             colmap_obs=colmap_obs,
             virtual_obs=virtual_obs,
+            sdf_mask=sdf_mask,
         )
-        poses_after = values_to_poses(result, len(frames))
-        after = frame_sdf_stats(frames, poses_after, sample_fn)
-        shifts = per_frame_shifts(init, result, len(frames))
+        poses_after = values_to_poses(result, len(frames_solve))
+        after = frame_sdf_stats(frames_solve, poses_after, sample_fn)
+        # The guard judges the SOLVE's own movement (vs the pre-aligned
+        # init): the pre-alignment already proved itself on the trimmed
+        # score. Total movement vs the original poses is reported too
+        # and is what gets written back.
+        import gtsam
+
+        init_orig = gtsam.Values()
+        for i, f in enumerate(frames):
+            init_orig.insert(i, gtsam.Pose2(f.x, f.y, f.yaw))
+        shifts = per_frame_shifts(init_pre, result, len(frames_solve))
+        shifts_total = per_frame_shifts(init_orig, result, len(frames))
         p90_shift = float(np.percentile(shifts, 90))
         corrected = bool(
             after.mean() < per_frame.mean() and p90_shift <= CORRECTION_P90_M
@@ -1306,23 +1506,26 @@ def run(
             "median_frame_shift_m": float(np.median(shifts)),
             "p90_frame_shift_m": p90_shift,
             "max_frame_shift_m": float(shifts.max()),
+            "median_total_shift_m": float(np.median(shifts_total)),
+            "max_total_shift_m": float(shifts_total.max()),
             "corrected": corrected,
         }
         logger.info(
-            "solve: wall->plan |dist| %.3fm -> %.3fm, frame shift "
-            "median %.3fm p90 %.3fm max %.3fm (%s)",
+            "solve: wall->plan |dist| %.3fm -> %.3fm, residual shift "
+            "median %.3fm p90 %.3fm max %.3fm, total median %.3fm (%s)",
             per_frame.mean(),
             after.mean(),
             float(np.median(shifts)),
             p90_shift,
             float(shifts.max()),
+            float(np.median(shifts_total)),
             "applied" if corrected else "SKIPPED by guard",
         )
         if corrected:
             write_corrected_poses(
                 registered_dir,
                 frames,
-                init,
+                init_orig,
                 result,
                 out_dir / "corrected_poses.npz",
             )
@@ -1330,7 +1533,7 @@ def run(
                 # The model is the pose source; correct/export propagate
                 # the corrected rig frames onto dmaps and exports.
                 apply_correction_to_model(
-                    model_dir, frames, frame_infos, init, result
+                    model_dir, frames, frame_infos, init_orig, result
                 )
             elif apply:
                 import shutil
@@ -1408,6 +1611,11 @@ def main() -> None:
         action="store_true",
         help="write the passing correction back to the model / poses.npz",
     )
+    parser.add_argument(
+        "--no_prealign",
+        action="store_true",
+        help="skip the coarse global SE2 pre-alignment + out-of-sheet gate",
+    )
     args = parser.parse_args()
     model_dir = args.model_dir
     if model_dir is None:
@@ -1425,6 +1633,7 @@ def main() -> None:
         model_dir=model_dir,
         structure=not args.no_structure,
         apply=args.apply,
+        prealign=not args.no_prealign,
     )
 
 

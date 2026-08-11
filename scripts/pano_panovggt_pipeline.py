@@ -506,7 +506,9 @@ def stage_correct(args: argparse.Namespace) -> None:
         from pano_rig_refine import rescale_dmaps_to_model
 
         rescale_dmaps_to_model(
-            args.workfolder / "sfm" / "sparse_enu", registered
+            args.workfolder / "sfm" / "sparse_enu",
+            registered,
+            error_field=not args.no_error_field,
         )
 
     # Re-render the face z-depths from the corrected dmaps so the MVS inputs
@@ -630,6 +632,12 @@ def get_args() -> argparse.Namespace:
         "--no_loop_closure",
         action="store_true",
         help="skip SALAD loop-closure mini-stars (star mode)",
+    )
+    parser.add_argument(
+        "--no_error_field",
+        action="store_true",
+        help="constant per-frame dmap rescale only (no log-linear "
+        "error field) in the correct stage",
     )
     parser.add_argument(
         "--floorplan_plan",
