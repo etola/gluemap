@@ -48,7 +48,13 @@ def initialize_mst_structures(
     predictions_dict["median_tri_angle"] = {}
 
     for star_idx, idx in enumerate(indexes):
-        node_idx_to_star_idx[predictions_dict["indexes"][idx][0]] = star_idx
+        # First star wins as the canonical star of its center image: when
+        # auxiliary stars share a center (e.g. loop-closure mini-stars),
+        # reverse-edge lookups must index the canonical star's
+        # median_tri_angle arrays.
+        node_idx_to_star_idx.setdefault(
+            predictions_dict["indexes"][idx][0], star_idx
+        )
 
         # Compute max of median triangulation angle across edges
         points3d = predictions_dict["points3d_virtual"][idx][0]  # (K, 3)
@@ -126,7 +132,11 @@ def initialize_mst_structures(
                     min(20, angle_current, angle_reverse) / 20
                 )  # downweight the edge if the triangulation angle is small
 
-            rel_poses[(idx_i, idx_j)] = (poses[0, i].cpu(), idx, i, score)
+            # Keep the best-scoring edge per ordered pair (matching the
+            # rotation-averaging edge selection) instead of last-wins.
+            existing = rel_poses.get((idx_i, idx_j))
+            if existing is None or existing[3] <= score:
+                rel_poses[(idx_i, idx_j)] = (poses[0, i].cpu(), idx, i, score)
 
     # Only consider the two side edges
     invalid_edges = []

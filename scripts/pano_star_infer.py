@@ -88,13 +88,22 @@ def main() -> None:
         default=3,
         help="sequential neighbors per side before GPS-nearest fill",
     )
+    parser.add_argument(
+        "--extra_pairs",
+        type=Path,
+        default=None,
+        help="loop_pairs.json from pano_loop_pairs.py; each pair (i, j) "
+        "becomes a 4-frame mini-star [i, i+1, j, j+1] whose sequential "
+        "sub-edges pin its scale, so the loop edge transports metric "
+        "scale across the revisit",
+    )
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
     import cv2
     import torch
     from ddpy_panovggt.infer import _load_pano_tensor, forward_pass, load_model
-    from ml_utils.geo import gps_fixes_to_enu, parse_gps_from_image
+    from ml_utils.geo import gps_fixes_to_enu, load_gps_fixes
 
     image_paths = sorted(
         p for p in args.images.iterdir() if p.suffix.lower() in IMAGE_EXTS
@@ -104,7 +113,9 @@ def main() -> None:
     names = [p.stem for p in image_paths]
     n = len(names)
 
-    fixes = [parse_gps_from_image(p) for p in image_paths]
+    # Sidecar-first (exif_overrides.json next to the dataset's images);
+    # per-image EXIF is the fallback for frames without an entry.
+    fixes = load_gps_fixes(image_paths)
     if any(fix is not None for fix in fixes):
         enu, anchor = gps_fixes_to_enu(fixes)
     else:
@@ -115,6 +126,25 @@ def main() -> None:
     logger.info("%d frames, %d with GPS", n, int(np.isfinite(enu[:, 0]).sum()))
 
     stars = build_stars(n, enu, args.star_size, args.seq_window)
+
+    if args.extra_pairs is not None and args.extra_pairs.exists():
+        idx_of = {name: i for i, name in enumerate(names)}
+        loop_pairs = json.loads(args.extra_pairs.read_text())["pairs"]
+        num_added = 0
+        for name_i, name_j, _score in loop_pairs:
+            i, j = idx_of.get(name_i), idx_of.get(name_j)
+            if i is None or j is None:
+                continue
+            members = [i, min(i + 1, n - 1), j, min(j + 1, n - 1)]
+            members = list(dict.fromkeys(members))  # dedupe, keep order
+            if len(members) >= 3:
+                stars.append(members)
+                num_added += 1
+        logger.info(
+            "Added %d loop-closure mini-stars from %s",
+            num_added,
+            args.extra_pairs,
+        )
 
     # Preload every pano once (resized to the model resolution).
     logger.info("Preloading %d panoramas ...", n)

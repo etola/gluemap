@@ -10,7 +10,9 @@ finally depth-map correction + exports for fusion.
 Workfolder layout (inputs marked *):
 
     workfolder/
-      images/*                  equirectangular panoramas (W = 2H), EXIF GPS
+      images/*                  equirectangular panoramas (W = 2H); GPS from
+                                exif_overrides.json sidecar (next to the
+                                images or the dataset dir) or EXIF
       masks/*                   optional binary masks (255 = valid, 0 = invalid)
       segmentations/*           optional class-id label maps
                                 (alternative to masks/)
@@ -52,7 +54,16 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-STAGES = ["infer", "register", "cubemap", "sift", "refine", "correct", "export"]
+STAGES = [
+    "infer",
+    "register",
+    "cubemap",
+    "sift",
+    "refine",
+    "floorplan",
+    "correct",
+    "export",
+]
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 
 
@@ -94,6 +105,23 @@ def stage_infer(args: argparse.Namespace) -> None:
         if (star_dir / "stars.json").exists() and not args.force:
             logger.info("[infer] %s exists; skipping", star_dir / "stars.json")
             return
+        loop_pairs = star_dir / "loop_pairs.json"
+        if not args.no_loop_closure and not loop_pairs.exists():
+            # Appearance-based revisit candidates (SALAD, gluemap env):
+            # the loop mini-stars pin the scale chain that a
+            # sequential-only star graph leaves free to drift.
+            star_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "pano_loop_pairs.py"),
+                    "--images",
+                    str(args.workfolder / "images"),
+                    "--out",
+                    str(loop_pairs),
+                ],
+                check=True,
+            )
         cmd = [
             _panovggt_python(args),
             str(SCRIPTS_DIR / "pano_star_infer.py"),
@@ -106,6 +134,8 @@ def stage_infer(args: argparse.Namespace) -> None:
             "--seq_window",
             str(args.seq_window),
         ]
+        if loop_pairs.exists():
+            cmd += ["--extra_pairs", str(loop_pairs)]
         masks_dir = args.workfolder / "masks"
         if masks_dir.is_dir():
             cmd += ["--mask_dir", str(masks_dir)]
@@ -417,6 +447,40 @@ def stage_refine(args: argparse.Namespace) -> None:
     )
 
 
+def stage_floorplan(args: argparse.Namespace) -> None:
+    """S6b (optional): snap the refined model onto the customer floor plan.
+
+    Runs only when --floorplan_plan / --floorplan_anchors are given.
+    The SE2 floor-plan BA corrects the sparse_enu rig frames in place
+    (guarded: only applied when wall->plan distance improves), so the
+    correct/export stages inherit the correction unchanged.
+    """
+    if args.floorplan_plan is None:
+        logger.info("[floorplan] no --floorplan_plan; skipping")
+        return
+    if args.floorplan_anchors is None:
+        raise SystemExit("--floorplan_plan requires --floorplan_anchors")
+    out_dir = args.workfolder / "floorplan_ba"
+    if (out_dir / "floorplan_report.json").exists() and not args.force:
+        logger.info(
+            "[floorplan] %s exists; skipping",
+            out_dir / "floorplan_report.json",
+        )
+        return
+    from pano_floorplan_ba import run as run_floorplan
+
+    run_floorplan(
+        args.workfolder,
+        args.floorplan_plan,
+        args.floorplan_anchors,
+        registered_dir=args.workfolder / "initial_registration",
+        out_dir=out_dir,
+        solve=True,
+        model_dir=args.workfolder / "sfm" / "sparse_enu",
+        apply=True,
+    )
+
+
 def stage_correct(args: argparse.Namespace) -> None:
     """S7: carry the BA pose correction back onto the registered depth maps."""
     registered = args.workfolder / "registered"
@@ -525,6 +589,7 @@ STAGE_FUNCS = {
     "cubemap": stage_cubemap,
     "sift": stage_sift,
     "refine": stage_refine,
+    "floorplan": stage_floorplan,
     "correct": stage_correct,
     "export": stage_export,
 }
@@ -561,6 +626,25 @@ def get_args() -> argparse.Namespace:
     )
     parser.add_argument("--star_size", type=int, default=8)
     parser.add_argument("--seq_window", type=int, default=3)
+    parser.add_argument(
+        "--no_loop_closure",
+        action="store_true",
+        help="skip SALAD loop-closure mini-stars (star mode)",
+    )
+    parser.add_argument(
+        "--floorplan_plan",
+        type=Path,
+        default=None,
+        help="floor-plan image; enables the floorplan stage (SE2 "
+        "plan-snap BA on the refined model)",
+    )
+    parser.add_argument(
+        "--floorplan_anchors",
+        type=Path,
+        default=None,
+        help="JSON with the plan's corner coordinates (corners_lla or "
+        "corners_enu, UL/UR/LR/LL)",
+    )
     parser.add_argument(
         "--min_edge_score",
         type=float,
