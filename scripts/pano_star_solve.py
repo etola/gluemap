@@ -2,7 +2,7 @@
 """Star-based global solve for the equirect pipeline (phase 2).
 
 Consumes the per-star PanoVGGT predictions written by
-pano_star_infer.py and fuses them with GLUEMAP's global mapping
+pano_star_infer.py and fuses them with ml_utils.star_solve global mapping
 machinery — the way feedforward outputs are meant to be used there:
 
   1. Covisibility scoring per star edge (round-trip spherical depth
@@ -364,12 +364,13 @@ def solve(
     start_end_json: Path | None = None,
 ) -> None:
     import torch
-
-    from gluemap.estimators.rotation_averaging import (
-        rotation_averaging_pycolmap,
+    from ml_utils.star_solve import (
+        initialize_mst_structures,
+        similarity_averaging,
     )
-    from gluemap.estimators.similarity_averaging import similarity_averaging
-    from gluemap.math.mst_initialization import initialize_mst_structures
+    from ml_utils.star_solve import (
+        rotation_averaging as rotation_averaging_pycolmap,
+    )
 
     meta, stars = load_stars(star_dir)
     names = meta["frames"]
