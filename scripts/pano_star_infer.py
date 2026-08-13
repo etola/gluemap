@@ -40,12 +40,21 @@ def build_stars(
     enu: np.ndarray,
     star_size: int,
     seq_window: int,
+    min_baseline: float = 0.3,
 ) -> list[list[int]]:
     """One star per frame: sequential neighbors first, GPS-nearest fill.
 
     Mirrors GLUEMAP's sequential-aware star construction: the capture
     order provides guaranteed-overlapping members, GPS proximity adds
     revisit edges (loop closures) beyond the window.
+
+    Stationary clusters (the operator standing still) are the degenerate
+    case: a star whose members all share the center's position has no
+    parallax, so the network's relative translations for it are
+    unconstrained hallucinations — observed parking two capture-tail
+    frames 36 m out. When the capture offers them, the two nearest frames
+    at least ``min_baseline`` metres away (by prior) always claim the
+    star's last slots.
     """
     from scipy.spatial import cKDTree
 
@@ -67,8 +76,56 @@ def build_stars(
                 j = int(gps_rows[row])
                 if j not in members:
                     members.append(j)
-        stars.append(members[:star_size])
+        star = members[:star_size]
+        if tree is not None and have_gps[i]:
+            _ensure_baseline_members(
+                star, i, enu, have_gps, gps_rows, star_size, min_baseline
+            )
+        stars.append(star)
     return stars
+
+
+def _ensure_baseline_members(
+    star: list[int],
+    center: int,
+    enu: np.ndarray,
+    have_gps: np.ndarray,
+    gps_rows: np.ndarray,
+    star_size: int,
+    min_baseline: float,
+    want: int = 2,
+) -> None:
+    """Give ``star`` at least ``want`` members ≥ ``min_baseline`` from its center.
+
+    No-op for normal walking stars (their sequential neighbors already carry
+    baseline); a stationary-cluster star gets its lowest-priority slots
+    replaced by the nearest genuinely displaced frames.
+    """
+    num_baseline = sum(
+        1
+        for j in star[1:]
+        if have_gps[j] and np.linalg.norm(enu[j] - enu[center]) >= min_baseline
+    )
+    if num_baseline >= want:
+        return
+    dists = np.linalg.norm(enu[gps_rows] - enu[center], axis=1)
+    candidates = [
+        int(gps_rows[r])
+        for r in np.argsort(dists)
+        if dists[r] >= min_baseline and int(gps_rows[r]) not in star
+    ]
+    slot = len(star) - 1
+    for j in candidates:
+        if num_baseline >= want:
+            break
+        if len(star) < star_size:
+            star.append(j)
+        elif slot > 0:
+            star[slot] = j
+            slot -= 1
+        else:
+            break
+        num_baseline += 1
 
 
 def main() -> None:

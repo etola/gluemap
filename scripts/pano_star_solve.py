@@ -340,6 +340,61 @@ def smooth_gps_deltas(
     return corr
 
 
+def pin_unanchored_frames(
+    c2w_all: np.ndarray,
+    names: list[str],
+    stars: list[dict],
+    gps: np.ndarray,
+    have_gps: np.ndarray,
+    min_baseline: float = 0.3,
+) -> int:
+    """Pin frames observed only through coincident views to their priors.
+
+    A frame whose every star membership pairs it solely with frames standing
+    at the same spot (by prior) has no parallax evidence: the network's
+    relative translations for identical views are unconstrained, so its
+    averaged position is a hallucination the robust layers downstream then
+    *protect* (observed: two stationary capture-tail frames parked 36 m out,
+    Cauchy-downweighted by the delta refine and Huber-saturated in the BA).
+    Such frames take their prior's xy and the z of the nearest anchored
+    frame in capture order. Returns the number of frames pinned.
+    """
+    idx_of = {name: i for i, name in enumerate(names)}
+    anchored = np.zeros(len(names), dtype=bool)
+    for star in stars:
+        rows = [idx_of[n] for n in star["names"] if n in idx_of]
+        for a in rows:
+            if anchored[a] or not have_gps[a]:
+                continue
+            for b in rows:
+                if (
+                    b != a
+                    and have_gps[b]
+                    and np.linalg.norm(gps[a] - gps[b]) >= min_baseline
+                ):
+                    anchored[a] = True
+                    break
+    pinned = 0
+    anchored_rows = np.nonzero(anchored)[0]
+    for i in range(len(names)):
+        if anchored[i] or not have_gps[i]:
+            continue
+        z = c2w_all[i, 2, 3]
+        if anchored_rows.size:
+            z = c2w_all[anchored_rows[np.argmin(np.abs(anchored_rows - i))], 2, 3]
+        logger.warning(
+            "%s has no baseline evidence (coincident star members only); "
+            "pinning to its prior",
+            names[i],
+        )
+        c2w_all[i, :2, 3] = gps[i, :2]
+        c2w_all[i, 2, 3] = z
+        pinned += 1
+    if pinned:
+        logger.info("Pinned %d unanchored frames to their priors", pinned)
+    return pinned
+
+
 def load_stars(star_dir: Path) -> tuple[dict, list[dict]]:
     meta = json.loads((star_dir / "stars.json").read_text())
     stars = []
@@ -470,6 +525,7 @@ def solve(
     if use_gps_deltas:
         deltas = smooth_gps_deltas(c2w_all[:, :3, 3].copy(), gps_arr, have_gps)
         c2w_all[:, :3, 3] += deltas
+        pin_unanchored_frames(c2w_all, names, stars, gps_arr, have_gps)
 
     # --- per-frame metric depth: median over observing stars ---------
     # global = star_local / s_star (similarity averaging convention),
